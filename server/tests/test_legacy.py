@@ -52,11 +52,11 @@ class TestGenerateSteps:
         assert steps[0]["action"] == "打开截图工具"
 
     def test_legacy_steps_no_target_element_id(self):
-        """老逻辑返回的步骤不应包含 target_element_id"""
+        """Mock fallback 步骤包含 target_element_id 字段（可为空）"""
         settings.USE_REAL_LLM = False
         steps = generate_steps("安装微信")
         for step in steps:
-            assert "target_element_id" not in step
+            assert "target_element_id" in step
 
 
 class TestProcessQuery:
@@ -69,13 +69,20 @@ class TestProcessQuery:
         assert response.intent.summary == "安装软件"
         assert len(response.steps) == 4
         assert response.steps[0].status == "active"
-        assert response.blueprint.state == "pending_confirm"
+        assert response.blueprint.state == "executing"
 
-    def test_process_first_step_binding_legacy(self):
-        """老逻辑：第一步绑定第一个元素（机械循环）"""
+    def test_process_first_step_binding_legacy(self, monkeypatch):
+        """无截图时 mock 场景：第一步绑定第一个元素"""
         settings.USE_REAL_LLM = False
+        monkeypatch.setattr(
+            "server.services.planning.router.generate_l2_steps",
+            lambda query, elements=None: None,
+        )
+        monkeypatch.setattr(
+            "server.services.planning.complexity_router.generate_l2_steps",
+            lambda query, elements=None: None,
+        )
         response = process_query("安装微信")
-        # 老逻辑：steps[0] 绑定 elements[0]，即 ~1
         assert response.steps[0].target_element_id == "~1"
         assert response.steps[0].annotation is not None
 

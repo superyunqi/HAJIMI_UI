@@ -53,12 +53,12 @@ def _call_replan_llm(prompt: str, timeout: int = 30) -> Optional[List[dict]]:
     """调用 LLM 进行重规划"""
     from server.services.llm.client import call_deepseek
 
-    result = call_deepseek(
+    result, _, _, _, _ = call_deepseek(
         query="请为上述步骤补全 target_element_id。",
         system_prompt=prompt,
         temperature=0.2,
         max_tokens=2000,
-        timeout=timeout,
+        speed_mode="fast",
     )
     if result and "steps" in result:
         return result["steps"]

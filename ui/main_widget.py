@@ -29,16 +29,21 @@ from config import (
     STARTUP_HEALTH_MAX_RETRIES,
 )
 from core.task_worker import TaskWorkerThread
+from core.step_advance_worker import StepAdvanceWorkerThread
 from core.api_client import check_inspect_preflight, get_api_status_message
 from core.user_settings import (
     apply_user_settings,
+    is_gpu_api_mode,
     is_intranet_mode,
     load_user_settings,
     save_user_settings,
 )
 from core.env_sync import sync_server_env
 from core.service_manager import (
+    restart_local_a_end,
+    run_gpu_one_click_bat,
     start_backend_services,
+    start_gpu_api_services,
     stop_backend_services,
     format_stop_summary,
 )
@@ -48,6 +53,7 @@ from ui.native.medium_panel import MediumPanel
 from ui.native.compact_bar import CompactBar
 from ui.native.suspension_dialog import SuspensionDialog
 from core.inspect_worker import InspectWorkerThread
+from core.chain_diagnostic_worker import ChainDiagnosticWorker
 from core.relocate_worker import RelocateWorkerThread
 from ui.native.prepare_step_dialog import PrepareStepDialog
 from ui.native.resize_grip import WindowResizeHandler
@@ -89,9 +95,12 @@ class MainWidget(QWidget):
         self._mode_switching = False
         self._prepare_hint = ""
         self._prepare_desc = ""
+        self._prepare_scene_dict = None
         self.overlay = OverlayAnnoWindow()
         self.worker = TaskWorkerThread(self)
+        self.step_worker = StepAdvanceWorkerThread(self)
         self.inspect_worker = InspectWorkerThread(self)
+        self.chain_diag_worker = ChainDiagnosticWorker(include_parse=True)
         self.relocate_worker = RelocateWorkerThread(self)
 
         if USE_NATIVE_UI:
@@ -170,7 +179,9 @@ class MainWidget(QWidget):
             self.resize(MEDIUM_WIDTH, MEDIUM_HEIGHT)
 
     def _init_native_ui(self):
-        self.controller = AppController(self.worker, main_window=self)
+        self.controller = AppController(
+            self.worker, step_worker=self.step_worker, main_window=self
+        )
         self.suspension_dialog = SuspensionDialog(self)
         self.prepare_step_dialog = PrepareStepDialog(self)
 
@@ -197,6 +208,7 @@ class MainWidget(QWidget):
         self._wire_controller()
         self._wire_native_widgets()
         self._wire_inspect_worker()
+        self._wire_chain_diag_worker()
         self._wire_relocate_worker()
         self._setup_tray()
         self._check_api_on_startup()
@@ -297,6 +309,7 @@ class MainWidget(QWidget):
 
     def _on_relocate_success(self, _data):
         self.prepare_step_dialog.set_busy(False)
+        self.prepare_step_dialog.hide()
         self.medium_panel.hide_prepare_banner()
 
     def _on_relocate_error(self, _msg):
@@ -305,18 +318,87 @@ class MainWidget(QWidget):
     def _on_relocate_finished(self):
         self.prepare_step_dialog.set_busy(False)
 
-    def _on_prepare_step(self, hint: str, desc: str):
+    def _on_prepare_guidance(self, payload: dict):
+        hint = payload.get("hint", "")
+        desc = payload.get("desc", "")
+        interaction = payload.get("interaction", "screen")
+        scene_dict = payload.get("scene") or {}
         self._prepare_hint = hint
         self._prepare_desc = desc
-        self.prepare_step_dialog.show_hint(hint, desc)
+        self._prepare_scene_dict = scene_dict
+        if interaction == "keyboard":
+            return
+        from core.prepare_guidance import PrepareScene
+
+        scene = PrepareScene.from_dict(scene_dict)
+        banner_text = desc or hint or "当前步骤"
+        self.medium_panel.show_prepare_banner(
+            banner_text,
+            scene_id=scene.scene_id,
+            banner_prefix=scene.banner_prefix,
+        )
+        if scene.scene_id != "keyboard_only":
+            self.prepare_step_dialog.show_guidance(scene)
+
+    def _on_prepare_topmost(self, enabled: bool):
+        if enabled:
+            self.raise_()
+            self.activateWindow()
+        else:
+            self.prepare_step_dialog.hide()
 
     def _on_prepare_dismissed(self, desc: str):
-        self.medium_panel.show_prepare_banner(desc or self._prepare_desc or "当前步骤")
+        scene_dict = self._prepare_scene_dict or {}
+        from core.prepare_guidance import PrepareScene
+
+        scene = PrepareScene.from_dict(scene_dict) if scene_dict else None
+        self.medium_panel.show_prepare_banner(
+            desc or self._prepare_desc or "当前步骤",
+            scene_id=scene.scene_id if scene else "locate_failed_first",
+            banner_prefix=scene.banner_prefix if scene else "⏳ 未定位到目标",
+        )
 
     def _on_prepare_banner(self):
-        self.prepare_step_dialog.show_hint(self._prepare_hint, self._prepare_desc)
+        if self._prepare_scene_dict:
+            from core.prepare_guidance import PrepareScene
 
-    def _on_prepare_confirmed(self):
+            self.prepare_step_dialog.show_guidance(
+                PrepareScene.from_dict(self._prepare_scene_dict)
+            )
+        else:
+            self.prepare_step_dialog.show_hint(
+                self._prepare_hint,
+                self._prepare_desc,
+                "locate_failed",
+            )
+
+    def _on_preset_chosen(self, preset_id: str):
+        from core.prepare_guidance import PrepareScene
+
+        scene_dict = self._prepare_scene_dict or {}
+        scene = PrepareScene.from_dict(scene_dict) if scene_dict else None
+        preset = scene.preset_by_id(preset_id) if scene else None
+        action = preset.action if preset else "relocate"
+
+        if action == "dismiss":
+            self.prepare_step_dialog.hide()
+            self.prepare_step_dialog.set_busy(False)
+            return
+
+        if action == "advance":
+            self.prepare_step_dialog.hide()
+            self.prepare_step_dialog.set_busy(False)
+            self.medium_panel.hide_prepare_banner()
+            self.controller.advance_step()
+            return
+
+        if action == "skip":
+            self.prepare_step_dialog.hide()
+            self.prepare_step_dialog.set_busy(False)
+            self.medium_panel.hide_prepare_banner()
+            self.controller.skip_current_step()
+            return
+
         if self.relocate_worker.isRunning():
             self.controller.message_added.emit(
                 "正在分析新画面，请稍候…", "system"
@@ -325,9 +407,22 @@ class MainWidget(QWidget):
         if not self.controller.task_id:
             return
         step_index = self.controller.current_step_index + 1
+        step = self.controller.steps[self.controller.current_step_index]
+        step_text = " ".join(
+            filter(
+                None,
+                [
+                    step.get("target"),
+                    step.get("description"),
+                    step.get("action"),
+                ],
+            )
+        )
         self.prepare_step_dialog.set_busy(True)
         self.controller.status_updated.emit("processing", "重新定位中…")
-        self.relocate_worker.request_relocate(self.controller.task_id, step_index)
+        self.relocate_worker.request_relocate(
+            self.controller.task_id, step_index, step_text
+        )
 
     def _wire_inspect_worker(self):
         w = self.inspect_worker
@@ -335,6 +430,12 @@ class MainWidget(QWidget):
         w.sig_inspect_error.connect(self.controller.on_inspect_error)
         w.sig_progress.connect(self._on_inspect_progress)
         w.finished.connect(self._on_inspect_finished)
+
+    def _wire_chain_diag_worker(self):
+        w = self.chain_diag_worker
+        w.sig_done.connect(self._on_chain_diag_done)
+        w.sig_error.connect(self._on_chain_diag_error)
+        w.finished.connect(self._on_chain_diag_finished)
 
     def _wire_controller(self):
         c = self.controller
@@ -350,16 +451,33 @@ class MainWidget(QWidget):
         c.inspect_status.connect(self.medium_panel.set_inspect_status)
         c.suspension_requested.connect(self.suspension_dialog.show_message)
         c.suspension_hidden.connect(self.suspension_dialog.hide)
-        c.prepare_step_requested.connect(self._on_prepare_step)
+        c.prepare_guidance_requested.connect(self._on_prepare_guidance)
+        c.prepare_topmost_requested.connect(self._on_prepare_topmost)
         c.mode_medium_requested.connect(lambda: self.switch_to_medium(animated=True))
         c.mode_compact_requested.connect(lambda: self.switch_to_compact(animated=True))
         self.suspension_dialog.resolved.connect(c.resolve_suspension)
-        self.prepare_step_dialog.confirmed.connect(self._on_prepare_confirmed)
+        self.prepare_step_dialog.preset_chosen.connect(self._on_preset_chosen)
         self.prepare_step_dialog.dismissed.connect(self._on_prepare_dismissed)
         self.medium_panel.prepare_banner_clicked.connect(self._on_prepare_banner)
         self.overlay.sig_target_clicked.connect(c.on_target_area_clicked)
 
         self.worker.sig_progress.connect(self._on_task_progress)
+        c.step_action_started.connect(self._on_step_action_started)
+        c.step_action_finished.connect(self._on_step_action_finished)
+        self.step_worker.sig_progress.connect(self._on_step_progress)
+
+    def _on_step_action_started(self, action: str):
+        self.medium_panel.set_step_controls_enabled(False)
+
+    def _on_step_action_finished(self):
+        self.medium_panel.set_step_controls_enabled(True)
+        self.medium_panel.set_stage_hint("")
+        if not self.controller._current_step_needs_prepare():
+            self.prepare_step_dialog.hide()
+            self.medium_panel.hide_prepare_banner()
+
+    def _on_step_progress(self, _pct: int, label: str):
+        self.medium_panel.set_stage_hint(label)
 
     def _on_status_updated(self, status: str, _label: str):
         busy = status == "processing"
@@ -381,7 +499,9 @@ class MainWidget(QWidget):
         p.inspect_requested.connect(self._on_inspect_requested)
         p.inspect_exit_requested.connect(self.controller.exit_inspect_mode)
         p.start_services_requested.connect(self._on_start_services)
+        p.gpu_one_click_requested.connect(self._on_gpu_one_click)
         p.stop_services_requested.connect(self._on_stop_services)
+        p.chain_diagnostic_requested.connect(self._on_chain_diagnostic)
         p.settings_saved.connect(self._on_settings_saved)
         p.appearance_preview_requested.connect(self._apply_appearance_preview)
         p.panel_resize_requested.connect(self._on_panel_resize_requested)
@@ -576,14 +696,15 @@ class MainWidget(QWidget):
     def _on_inspect_requested(self):
         if self.inspect_worker.isRunning():
             self.medium_panel.set_inspect_status(
-                "检测进行中，CPU 约 2–4 分钟，请勿重复点击…"
+                "检测进行中，请勿重复点击…"
             )
             return
 
         ok, reason = check_inspect_preflight()
         if not ok:
-            self.medium_panel.set_inspect_status(f"检验失败: {reason}")
-            self.controller.message_added.emit(f"检验失败: {reason}", "system danger")
+            hint = f"检验失败: {reason}（可点击设置页「链路诊断」查看详情）"
+            self.medium_panel.set_inspect_status(hint)
+            self.controller.message_added.emit(hint, "system danger")
             return
 
         if not self.controller.run_inspect():
@@ -591,6 +712,29 @@ class MainWidget(QWidget):
         self.overlay.clear_annotations()
         self.medium_panel.set_inspect_busy(True)
         self.inspect_worker.start()
+
+    def _on_chain_diagnostic(self):
+        if self.chain_diag_worker.isRunning():
+            return
+        self.medium_panel.set_chain_diag_busy(True)
+        self.medium_panel.set_chain_diag_status("正在采集链路数据…")
+        self.chain_diag_worker.start()
+
+    def _on_chain_diag_done(self, report: str):
+        self.medium_panel.set_chain_diag_report(report)
+        ok = "总体: 就绪" in report
+        status = "链路就绪" if ok else "链路未就绪 — 见下方报告"
+        self.medium_panel.set_chain_diag_status(status)
+        self.controller.message_added.emit(
+            status,
+            "system" if ok else "system danger",
+        )
+
+    def _on_chain_diag_error(self, message: str):
+        self.medium_panel.set_chain_diag_status(f"诊断失败: {message}")
+
+    def _on_chain_diag_finished(self):
+        self.medium_panel.set_chain_diag_busy(False)
 
     def _on_inspect_finished(self):
         self.medium_panel.set_inspect_busy(False)
@@ -614,9 +758,18 @@ class MainWidget(QWidget):
             merged = save_user_settings(data)
             apply_user_settings(merged)
             self._apply_native_appearance(merged)
-            if merged.get("deployment_mode") == "local":
+            if merged.get("deployment_mode") in ("local", "gpu_api"):
                 sync_server_env(merged)
-            mode_label = "内网 API" if is_intranet_mode() else "本地启动"
+                restart_local_a_end()
+            if is_intranet_mode():
+                mode_label = "内网 API"
+            elif is_gpu_api_mode():
+                mode_label = "GPU API"
+            else:
+                mode_label = "本地 CPU"
+            restart_note = ""
+            if merged.get("deployment_mode") in ("local", "gpu_api"):
+                restart_note = "；A 端已重启以加载新配置"
             ui_theme = merged.get("ui_theme", "current")
             theme_label = THEME_LABELS.get(ui_theme, "默认")
             font_size = merged.get("font_size", 13)
@@ -642,7 +795,7 @@ class MainWidget(QWidget):
                 )
             self.medium_panel.on_settings_applied(
                 merged,
-                f"已保存，当前会话：{detail}",
+                f"已保存，当前会话：{detail}{restart_note}",
             )
             text, msg_type = self._refresh_api_status()
             self.controller.message_added.emit("配置已保存并应用", "system")
@@ -662,7 +815,26 @@ class MainWidget(QWidget):
         try:
             from core.user_settings import load_user_settings
 
-            sync_server_env(load_user_settings())
+            settings = load_user_settings()
+            sync_server_env(settings)
+            if is_gpu_api_mode():
+                start_gpu_api_services()
+                from core.routing_config import routing_needs_omniparser
+
+                if not routing_needs_omniparser():
+                    self.medium_panel.set_service_status(
+                        "已启动本机 A 端（L4 Vision 模式，仅需 LLM，无需 :9800 隧道）。"
+                    )
+                    self.controller.message_added.emit(
+                        "已启动本机 A 端（L4 Vision 模式）", "system"
+                    )
+                    return
+                self.medium_panel.set_service_status(
+                    "已启动本机 A 端。请先运行「一键 GPU」或保持 :9800 隧道，"
+                    "再执行检验（约 2–5 秒）。"
+                )
+                self.controller.message_added.emit("已启动本机 A 端（GPU API 模式）", "system")
+                return
             start_backend_services()
             self.medium_panel.set_service_status(
                 "已清理旧进程并启动新窗口；请等待 OmniParser「Omniparser initialized」"
@@ -675,6 +847,17 @@ class MainWidget(QWidget):
             self.medium_panel.set_service_status(f"启动失败: {exc}")
             self.controller.message_added.emit(f"启动后端失败: {exc}", "system danger")
 
+    def _on_gpu_one_click(self):
+        try:
+            run_gpu_one_click_bat()
+            self.medium_panel.set_service_status(
+                "已打开「HAJIMI-GPU-OneClick」窗口：远程 start.sh → 隧道 → A 端 → UI。"
+            )
+            self.controller.message_added.emit("已启动一键 GPU 脚本", "system")
+        except Exception as exc:
+            self.medium_panel.set_service_status(f"一键 GPU 失败: {exc}")
+            self.controller.message_added.emit(f"一键 GPU 失败: {exc}", "system danger")
+
     def _on_stop_services(self):
         result = stop_backend_services()
         summary = format_stop_summary(result)
@@ -682,7 +865,7 @@ class MainWidget(QWidget):
         self.controller.message_added.emit(f"已停止后端服务: {summary}", "system")
 
     def _shutdown_workers(self, max_wait_ms: int = 2000):
-        for name in ("worker", "inspect_worker"):
+        for name in ("worker", "step_worker", "inspect_worker", "chain_diag_worker"):
             w = getattr(self, name, None)
             if w and w.isRunning():
                 w.terminate()

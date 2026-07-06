@@ -67,12 +67,28 @@ class Step(BaseModel):
     step_index: int = Field(..., ge=1)
     action: str
     description: str
+    target: Optional[str] = Field(
+        None,
+        description="Planner 生成的 UI 目标简短名称，供 Locator 使用",
+    )
     target_element_id: Optional[str] = None
     status: str = Field(
         ...,
         pattern="^(pending|active|done|skipped|failed)$",
     )
     annotation: Optional[Annotation] = None
+    interaction: Optional[str] = Field(
+        None,
+        description='步骤交互类型："keyboard" 纯快捷键，"screen" 需屏幕定位',
+    )
+    locate_deferred: Optional[bool] = Field(
+        None,
+        description="True 时本步需用户先手动完成，下一步 advance 再 Vision 定位",
+    )
+    prepare_hint: Optional[str] = Field(
+        None,
+        description="locate_deferred 时展示给用户的操作提示",
+    )
 
 
 class Blueprint(BaseModel):
@@ -127,6 +143,27 @@ class ProcessRequest(BaseModel):
     )
     window_title: Optional[str] = Field(None, max_length=256)
     context: Optional[List[ChatTurn]] = Field(None, max_length=3)
+    screen_fingerprint: Optional[str] = Field(
+        None,
+        max_length=64,
+        description="B 端屏幕指纹，用于 parse 结果缓存",
+    )
+    capture_size: Optional[List[int]] = Field(
+        None,
+        description="原始截图像素 [w,h]，L4 坐标校准",
+    )
+    upload_size: Optional[List[int]] = Field(
+        None,
+        description="实际上传图像素 [w,h]",
+    )
+    screen_metrics: Optional[dict] = Field(
+        None,
+        description="B 端屏幕 DPR/逻辑尺寸，供 L4 overlay 映射",
+    )
+    assist_bundle: Optional[dict] = Field(
+        None,
+        description="B 端辅助采集包：前台窗口/场景/结构化候选",
+    )
 
 
 class ProcessResponse(BaseModel):
@@ -169,6 +206,10 @@ class StepRequest(BaseModel):
         None,
         description="新截图 Base64；用于无绑定步骤的动态重规划",
     )
+    capture_size: Optional[List[int]] = None
+    upload_size: Optional[List[int]] = None
+    screen_metrics: Optional[dict] = None
+    assist_bundle: Optional[dict] = None
 
 
 class StepResponse(BaseModel):
@@ -234,6 +275,10 @@ class HealthResponse(BaseModel):
     detector_device: Optional[str] = None
     omniparser_url: Optional[str] = None
     omniparser_ready: Optional[bool] = None
+    config_source: Optional[str] = None
+    routing_mode: Optional[str] = None
+    llm_configured: Optional[bool] = None
+    l4_capable: Optional[bool] = None
 
 
 class RelocateRequest(BaseModel):
@@ -245,6 +290,10 @@ class RelocateRequest(BaseModel):
         ...,
         description="新截图 Base64，含 data URI 前缀",
     )
+    capture_size: Optional[List[int]] = None
+    upload_size: Optional[List[int]] = None
+    screen_metrics: Optional[dict] = None
+    assist_bundle: Optional[dict] = None
 
 
 class RelocateResponse(BaseModel):
@@ -261,6 +310,30 @@ class RelocateResponse(BaseModel):
     )
 
 
+class LocateRequest(BaseModel):
+    """Per-step Vision 定位 — L4 / L3_DEFERRED 路径"""
+
+    task_id: str
+    step_index: int = Field(..., ge=1)
+    image: str = Field(..., description="当前截图 Base64")
+    query: Optional[str] = Field(None, description="可选覆盖原始用户目标")
+    capture_size: Optional[List[int]] = None
+    upload_size: Optional[List[int]] = None
+    screen_metrics: Optional[dict] = None
+
+
+class LocateResponse(BaseModel):
+    """Vision 定位响应"""
+
+    success: bool = True
+    task_id: str
+    step_index: int
+    target_element_id: Optional[str] = None
+    annotation: Optional[Annotation] = None
+    reference_resolution: Optional[List[int]] = None
+    detection_meta: Optional[dict] = None
+
+
 class InspectRequest(BaseModel):
     """检验模式请求 — 立即检测当前屏幕，不生成 task/steps"""
 
@@ -273,6 +346,11 @@ class InspectRequest(BaseModel):
     )
     screen_height: Optional[int] = Field(
         None, description="屏幕物理高度（像素）"
+    )
+    screen_fingerprint: Optional[str] = Field(
+        None,
+        max_length=64,
+        description="B 端屏幕指纹，用于 parse 结果缓存",
     )
 
 

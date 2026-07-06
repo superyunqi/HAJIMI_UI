@@ -13,6 +13,7 @@ from PyQt5.QtWidgets import (
     QFrame,
     QPushButton,
     QSlider,
+    QCheckBox,
 )
 
 from ui.native.luxury.qss import LUXURY_BG_MODES
@@ -114,24 +115,32 @@ class DeploymentModeGroup(QFrame):
         title.setObjectName("SectionTitle")
         layout.addWidget(title)
 
-        hint = QLabel("本地启动：本机 OmniParser + A 端；内网 API：仅连接远程 A 端（需校园网/VPN）")
+        hint = QLabel(
+            "GPU API（推荐）：本机 A 端 + SSH 隧道 :9800；"
+            "本地 CPU：本机 OmniParser :8002 + A 端；"
+            "内网 API：仅连远程 A 端（需校园网/VPN）"
+        )
         hint.setObjectName("HintTextSmall")
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
-        self._local = QRadioButton("本地启动")
+        self._gpu_api = QRadioButton("GPU API（推荐）")
+        self._gpu_api.setObjectName("SettingsRadio")
+        self._local = QRadioButton("本地 CPU")
         self._local.setObjectName("SettingsRadio")
         self._intranet = QRadioButton("内网 API")
         self._intranet.setObjectName("SettingsRadio")
-        self._local.setChecked(True)
+        self._gpu_api.setChecked(True)
 
         self._group = QButtonGroup(self)
-        self._group.addButton(self._local, 0)
-        self._group.addButton(self._intranet, 1)
+        self._group.addButton(self._gpu_api, 0)
+        self._group.addButton(self._local, 1)
+        self._group.addButton(self._intranet, 2)
         self._group.buttonClicked.connect(self._on_click)
 
         row = QHBoxLayout()
-        row.setSpacing(16)
+        row.setSpacing(12)
+        row.addWidget(self._gpu_api)
         row.addWidget(self._local)
         row.addWidget(self._intranet)
         row.addStretch()
@@ -141,13 +150,163 @@ class DeploymentModeGroup(QFrame):
         self.mode_changed.emit(self.current_mode())
 
     def current_mode(self) -> str:
-        return "intranet" if self._intranet.isChecked() else "local"
+        if self._intranet.isChecked():
+            return "intranet"
+        if self._local.isChecked():
+            return "local"
+        return "gpu_api"
 
     def set_mode(self, mode: str) -> None:
         if mode == "intranet":
             self._intranet.setChecked(True)
-        else:
+        elif mode == "local":
             self._local.setChecked(True)
+        else:
+            self._gpu_api.setChecked(True)
+
+
+class GuidanceRouteGroup(QFrame):
+    """指引路由：显式 L4 / L3_DEFERRED / L3 / 自动。"""
+
+    mode_changed = pyqtSignal(str)
+
+    _MODES = (
+        ("fast", "L4 Vision 快路径（推荐）", "跳过 OmniParser，Planner+Locator Vision，仅需 A 端+LLM"),
+        ("balanced", "L3 逐步 Vision", "先文本规划，每步 Vision 定位，不需 OmniParser"),
+        ("precision", "L3 OmniParser 精准", "全屏 UI 检测 + 元素绑定，需 GPU/CPU 检测服务"),
+        ("auto", "自动选择", "有截图时优先 L4，模板/浏览器等自动分流"),
+    )
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("Card")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(8)
+
+        title = QLabel("指引路由")
+        title.setObjectName("SectionTitle")
+        layout.addWidget(title)
+
+        hint = QLabel(
+            "选择任务处理路径。日常指引请选「L4 Vision 快路径」；"
+            "需要 SoM 元素编号与最高精度时选 OmniParser 精准。"
+        )
+        hint.setObjectName("HintTextSmall")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        self._buttons: dict[str, QRadioButton] = {}
+        self._group = QButtonGroup(self)
+        for idx, (mode_id, label, _desc) in enumerate(self._MODES):
+            rb = QRadioButton(label)
+            rb.setObjectName("SettingsRadio")
+            self._group.addButton(rb, idx)
+            self._buttons[mode_id] = rb
+            layout.addWidget(rb)
+        self._buttons["fast"].setChecked(True)
+        self._group.buttonClicked.connect(self._on_click)
+
+        self._mode_hint = QLabel(self._MODES[0][2])
+        self._mode_hint.setObjectName("HintTextSmall")
+        self._mode_hint.setWordWrap(True)
+        layout.addWidget(self._mode_hint)
+
+    def _on_click(self):
+        mode = self.current_mode()
+        for mid, _label, desc in self._MODES:
+            if mid == mode:
+                self._mode_hint.setText(desc)
+                break
+        self.mode_changed.emit(mode)
+
+    def current_mode(self) -> str:
+        for mode_id, rb in self._buttons.items():
+            if rb.isChecked():
+                return mode_id
+        return "fast"
+
+    def set_mode(self, mode: str) -> None:
+        target = mode if mode in self._buttons else "fast"
+        self._buttons[target].setChecked(True)
+        for mid, _label, desc in self._MODES:
+            if mid == target:
+                self._mode_hint.setText(desc)
+                break
+
+
+# 兼容旧引用
+SpeedModeGroup = GuidanceRouteGroup
+
+
+class L4VisionGroup(QFrame):
+    """L4 Vision 快路径：Planner / Locator 模型与 Pipeline 开关。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("Card")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(8)
+
+        title = QLabel("L4 Vision 模型")
+        title.setObjectName("SectionTitle")
+        layout.addWidget(title)
+
+        hint = QLabel(
+            "快速路由下使用。Planner 默认纯文本规划；Locator 必须支持识图（Vision）。"
+            "留空则 Planner 用 DeepSeek、Locator 用上方「问答模型名」。"
+            "保存后写入 server/.env，本地/GPU 模式会自动重启 A 端。"
+        )
+        hint.setObjectName("HintTextSmall")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        self._field_planner = SettingsFieldRow(
+            "L4 Planner 模型",
+            "留空=DeepSeek，如 deepseek-chat",
+        )
+        self._field_locator = SettingsFieldRow(
+            "L4 Locator 模型",
+            "gpt-5.5（Vision 识图定位）",
+        )
+        layout.addWidget(self._field_planner)
+        layout.addWidget(self._field_locator)
+
+        self._planner_vision = QCheckBox("Planner 规划时也传截图（默认关，更省 token）")
+        self._planner_vision.setObjectName("SettingsRadio")
+        self._strict_locate = QCheckBox("Strict 定位：无坐标时自动重试一次")
+        self._strict_locate.setObjectName("SettingsRadio")
+        self._pipeline = QCheckBox("轻量 Pipeline：屏幕摘要 + UIA 窗口提示")
+        self._pipeline.setObjectName("SettingsRadio")
+        self._strict_locate.setChecked(True)
+        self._pipeline.setChecked(True)
+
+        for cb in (self._planner_vision, self._strict_locate, self._pipeline):
+            layout.addWidget(cb)
+
+    def set_values(self, data: dict) -> None:
+        self._field_planner.set_text(data.get("planner_model", ""))
+        self._field_locator.set_text(data.get("locator_model", ""))
+        self._planner_vision.setChecked(bool(data.get("planner_use_vision")))
+        self._strict_locate.setChecked(bool(data.get("strict_locate", True)))
+        self._pipeline.setChecked(bool(data.get("pipeline_enabled", True)))
+
+    def get_values(self) -> dict:
+        return {
+            "planner_model": self._field_planner.text(),
+            "locator_model": self._field_locator.text(),
+            "planner_use_vision": self._planner_vision.isChecked(),
+            "strict_locate": self._strict_locate.isChecked(),
+            "pipeline_enabled": self._pipeline.isChecked(),
+        }
+
+    def set_enabled(self, enabled: bool) -> None:
+        self._field_planner.set_enabled(enabled)
+        self._field_locator.set_enabled(enabled)
+        self._planner_vision.setEnabled(enabled)
+        self._strict_locate.setEnabled(enabled)
+        self._pipeline.setEnabled(enabled)
 
 
 class UiAppearanceGroup(QFrame):

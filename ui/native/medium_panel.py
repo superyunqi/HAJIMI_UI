@@ -20,6 +20,7 @@ from config import (
     MEDIUM_WIDTH,
     MEDIUM_HEIGHT,
 )
+from core.defaults import DEFAULT_OMNI_GPU_API_URL, DEFAULT_OMNI_LOCAL_URL
 from core.user_settings import load_user_settings
 from ui.native.window_state import clamp_size, _screen_max
 from ui.chat_bubble import ChatBubble
@@ -49,6 +50,8 @@ from ui.native.widgets import (
 )
 from ui.native.settings_widgets import (
     DeploymentModeGroup,
+    GuidanceRouteGroup,
+    L4VisionGroup,
     SettingsFieldRow,
     SettingsEnterFilter,
     UiAppearanceGroup,
@@ -100,7 +103,9 @@ class MediumPanel(QWidget):
     inspect_requested = pyqtSignal()
     inspect_exit_requested = pyqtSignal()
     start_services_requested = pyqtSignal()
+    gpu_one_click_requested = pyqtSignal()
     stop_services_requested = pyqtSignal()
+    chain_diagnostic_requested = pyqtSignal()
     settings_saved = pyqtSignal(dict)
     appearance_preview_requested = pyqtSignal(dict)
     panel_resize_requested = pyqtSignal(int, int)
@@ -532,6 +537,13 @@ class MediumPanel(QWidget):
         self._deployment_mode.mode_changed.connect(self._on_deployment_mode_changed)
         il.addWidget(self._deployment_mode)
 
+        self._guidance_route = GuidanceRouteGroup()
+        self._guidance_route.mode_changed.connect(self._apply_guidance_route_ui)
+        il.addWidget(self._guidance_route)
+
+        self._l4_group = L4VisionGroup()
+        il.addWidget(self._l4_group)
+
         self._appearance_group = UiAppearanceGroup()
         self._appearance_group.save_requested.connect(self._save_settings)
         self._appearance_group.appearance_preview_requested.connect(
@@ -553,10 +565,12 @@ class MediumPanel(QWidget):
 
         self._field_a_url = SettingsFieldRow("A 端地址", "http://127.0.0.1:8010")
         self._field_demo_key = SettingsFieldRow("Demo Key", "hajimi-demo-2026")
-        self._field_llm_base = SettingsFieldRow("问答 API Base", "https://api.deepseek.com")
+        self._field_llm_base = SettingsFieldRow(
+            "问答 API Base", "https://www.daseinai.xyz/v1"
+        )
         self._field_llm_key = SettingsFieldRow("问答 API Key", "", password=True)
-        self._field_llm_model = SettingsFieldRow("问答模型名", "deepseek-chat")
-        self._field_omni_url = SettingsFieldRow("OmniParser 地址", "http://127.0.0.1:8002")
+        self._field_llm_model = SettingsFieldRow("问答模型名", "gpt-5.5")
+        self._field_omni_url = SettingsFieldRow("OmniParser 地址", DEFAULT_OMNI_GPU_API_URL)
         self._field_omni_gpu = SettingsFieldRow(
             "OmniParser GPU", "可选，SSH 隧道端口如 http://127.0.0.1:8002"
         )
@@ -592,6 +606,8 @@ class MediumPanel(QWidget):
             self._field_llm_model.input,
             self._field_omni_url.input,
             self._field_omni_gpu.input,
+            self._l4_group._field_planner.input,
+            self._l4_group._field_locator.input,
         ]
         self._settings_enter_filter = SettingsEnterFilter(self._save_settings)
         for inp in self._settings_inputs:
@@ -625,7 +641,7 @@ class MediumPanel(QWidget):
         dl.addWidget(self._inspect_status)
 
         self._inspect_hint = QLabel(
-            "CPU 本地检测约需 2–4 分钟，检测期间请勿重复点击。"
+            "GPU API 模式约 2–5 秒；本地 CPU 约 2–4 分钟。检测期间请勿重复点击。"
         )
         self._inspect_hint.setObjectName("HintTextSmall")
         self._inspect_hint.setWordWrap(True)
@@ -642,15 +658,38 @@ class MediumPanel(QWidget):
         dl.addWidget(self._api_lbl)
 
         svc_row = QHBoxLayout()
-        self._start_services_btn = QPushButton("启动 OmniParser + A 端")
+        self._start_services_btn = QPushButton("启动 A 端")
         self._start_services_btn.setObjectName("StepBtnPrimary")
         self._start_services_btn.clicked.connect(self.start_services_requested.emit)
         svc_row.addWidget(self._start_services_btn)
+        self._gpu_one_click_btn = QPushButton("一键 GPU")
+        self._gpu_one_click_btn.setObjectName("StepBtn")
+        self._gpu_one_click_btn.clicked.connect(self.gpu_one_click_requested.emit)
+        svc_row.addWidget(self._gpu_one_click_btn)
         self._stop_services_btn = QPushButton("停止全部服务")
         self._stop_services_btn.setObjectName("StepBtn")
         self._stop_services_btn.clicked.connect(self.stop_services_requested.emit)
         svc_row.addWidget(self._stop_services_btn)
         dl.addLayout(svc_row)
+
+        diag_row = QHBoxLayout()
+        self._chain_diag_btn = QPushButton("链路诊断")
+        self._chain_diag_btn.setObjectName("StepBtn")
+        self._chain_diag_btn.clicked.connect(self.chain_diagnostic_requested.emit)
+        diag_row.addWidget(self._chain_diag_btn)
+        self._chain_diag_status = QLabel("")
+        self._chain_diag_status.setObjectName("HintTextSmall")
+        self._chain_diag_status.setWordWrap(True)
+        diag_row.addWidget(self._chain_diag_status, 1)
+        dl.addLayout(diag_row)
+
+        self._chain_diag_output = QTextEdit()
+        self._chain_diag_output.setObjectName("ChainDiagOutput")
+        self._chain_diag_output.setReadOnly(True)
+        self._chain_diag_output.setMinimumHeight(120)
+        self._chain_diag_output.setPlaceholderText("点击「链路诊断」查看 B→A→OmniParser 全链路状态…")
+        self._chain_diag_output.hide()
+        dl.addWidget(self._chain_diag_output)
 
         self._stop_on_exit_cb = QCheckBox("关闭窗口时停止 A 端与 OmniParser")
         self._stop_on_exit_cb.setChecked(STOP_SERVICES_ON_EXIT)
@@ -659,6 +698,7 @@ class MediumPanel(QWidget):
         self._local_svc_widgets = (
             svc_title,
             self._start_services_btn,
+            self._gpu_one_click_btn,
             self._stop_services_btn,
             self._stop_on_exit_cb,
         )
@@ -678,8 +718,10 @@ class MediumPanel(QWidget):
         return page
 
     def load_settings_form(self) -> None:
+        from core.l4_settings import merge_l4_for_display
+
         data = load_user_settings()
-        self._deployment_mode.set_mode(data.get("deployment_mode", "local"))
+        self._deployment_mode.set_mode(data.get("deployment_mode", "gpu_api"))
         self._appearance_group.set_appearance(data)
         self._appearance_group.sync_mode_sections()
         self._field_a_url.set_text(data.get("a_end_url", ""))
@@ -688,10 +730,14 @@ class MediumPanel(QWidget):
         self._field_llm_base.set_text(llm.get("base_url", ""))
         self._field_llm_key.set_text(llm.get("api_key", ""))
         self._field_llm_model.set_text(llm.get("model", ""))
+        route = data.get("routing_mode") or data.get("llm_speed_mode", "fast")
+        self._guidance_route.set_mode(route)
+        self._l4_group.set_values(merge_l4_for_display(data.get("l4")))
         omni = data.get("omniparser") or {}
         self._field_omni_url.set_text(omni.get("url", ""))
         self._field_omni_gpu.set_text(omni.get("gpu_url", ""))
-        self._apply_deployment_mode_ui(data.get("deployment_mode", "local"))
+        self._apply_deployment_mode_ui(data.get("deployment_mode", "gpu_api"))
+        self._apply_guidance_route_ui(route)
 
     def _forward_appearance_preview(self, data: dict) -> None:
         self.appearance_preview_requested.emit(data)
@@ -702,18 +748,33 @@ class MediumPanel(QWidget):
         if mode == "intranet" and not a_url:
             raise ValueError("内网 API 模式下 A 端地址为必填项")
         appearance = self._appearance_group.current_appearance()
+        default_omni = (
+            DEFAULT_OMNI_LOCAL_URL
+            if mode == "local"
+            else DEFAULT_OMNI_GPU_API_URL
+        )
+        route = self._guidance_route.current_mode()
+        speed_map = {
+            "auto": "fast",
+            "fast": "fast",
+            "balanced": "balanced",
+            "precision": "precision",
+        }
         return {
             "deployment_mode": mode,
             **appearance,
             "a_end_url": a_url or "http://127.0.0.1:8010",
             "demo_key": self._field_demo_key.text() or "hajimi-demo-2026",
+            "routing_mode": route,
+            "llm_speed_mode": speed_map.get(route, "fast"),
+            "l4": self._l4_group.get_values(),
             "llm": {
                 "base_url": self._field_llm_base.text(),
                 "api_key": self._field_llm_key.text(),
                 "model": self._field_llm_model.text() or "deepseek-chat",
             },
             "omniparser": {
-                "url": self._field_omni_url.text() or "http://127.0.0.1:8002",
+                "url": self._field_omni_url.text() or default_omni,
                 "gpu_url": self._field_omni_gpu.text(),
             },
         }
@@ -731,10 +792,31 @@ class MediumPanel(QWidget):
     def _on_deployment_mode_changed(self, mode: str) -> None:
         self._apply_deployment_mode_ui(mode)
 
+    def _apply_guidance_route_ui(self, mode: str) -> None:
+        """L4 / L3_DEFERRED 可编辑 L4 模型；精准模式禁用。"""
+        use_l4_settings = mode in ("auto", "fast", "balanced")
+        self._l4_group.setVisible(True)
+        self._l4_group.set_enabled(use_l4_settings)
+
     def _apply_deployment_mode_ui(self, mode: str) -> None:
         intranet = mode == "intranet"
+        gpu_api = mode == "gpu_api"
         for w in self._local_svc_widgets:
             w.setVisible(not intranet)
+        self._gpu_one_click_btn.setVisible(gpu_api)
+        if gpu_api:
+            self._start_services_btn.setText("启动 A 端")
+            self._inspect_hint.setText(
+                "GPU API 模式约 2–5 秒；请先运行「一键 GPU」或保持 :9800 隧道。"
+            )
+        elif mode == "local":
+            self._start_services_btn.setText("启动 OmniParser + A 端")
+            self._inspect_hint.setText(
+                "本地 CPU 检测约 2–4 分钟，检测期间请勿重复点击。"
+            )
+        else:
+            self._start_services_btn.setText("启动 A 端")
+            self._inspect_hint.setText("内网 API 模式由远程 A 端执行检测。")
         llm_fields = (
             self._field_llm_base,
             self._field_llm_key,
@@ -744,6 +826,9 @@ class MediumPanel(QWidget):
         )
         for row in llm_fields:
             row.set_enabled(not intranet)
+        self._apply_guidance_route_ui(self._guidance_route.current_mode())
+        if intranet:
+            self._l4_group.set_enabled(False)
         self._update_api_url_label()
 
     def _update_api_url_label(self) -> None:
@@ -755,7 +840,7 @@ class MediumPanel(QWidget):
         feedback = success_msg or "已保存并应用"
         self._settings_feedback.setText(feedback)
         self._appearance_group.set_feedback(feedback)
-        self._apply_deployment_mode_ui(data.get("deployment_mode", "local"))
+        self._apply_deployment_mode_ui(data.get("deployment_mode", "gpu_api"))
         self._update_api_url_label()
 
     def apply_appearance(
@@ -866,6 +951,8 @@ class MediumPanel(QWidget):
         next_btn = QPushButton("下一步")
         next_btn.setObjectName("StepBtnPrimary")
         next_btn.clicked.connect(self.next_clicked.emit)
+        self._step_prev_btn = prev_btn
+        self._step_next_btn = next_btn
         layout.addWidget(prev_btn)
         layout.addWidget(next_btn)
         return bar
@@ -1146,8 +1233,29 @@ class MediumPanel(QWidget):
         self._input.setEnabled(enabled)
         self._send_btn.setEnabled(enabled)
 
-    def show_prepare_banner(self, text: str):
-        self._prepare_banner_btn.setText(f"⏳ 待重新定位：{text} — 点击继续")
+    def set_step_controls_enabled(self, enabled: bool):
+        if hasattr(self, "_step_prev_btn"):
+            self._step_prev_btn.setEnabled(enabled)
+        if hasattr(self, "_step_next_btn"):
+            self._step_next_btn.setEnabled(enabled)
+
+    def show_prepare_banner(
+        self,
+        text: str,
+        reason: str = "locate_failed",
+        *,
+        scene_id: str = "",
+        banner_prefix: str = "",
+    ):
+        if banner_prefix:
+            prefix = banner_prefix
+        elif scene_id == "locate_failed_retry" or scene_id == "multi_step_stuck":
+            prefix = "⏳ 可尝试继续下一步"
+        elif scene_id == "deferred_manual" or reason == "deferred":
+            prefix = "⏳ 请先手动完成"
+        else:
+            prefix = "⏳ 未定位到目标"
+        self._prepare_banner_btn.setText(f"{prefix}：{text} — 点击继续")
         self._prepare_banner.show()
 
     def hide_prepare_banner(self):
@@ -1201,6 +1309,18 @@ class MediumPanel(QWidget):
 
     def set_inspect_bar_visible(self, visible: bool):
         self._inspect_bar.show() if visible else self._inspect_bar.hide()
+
+    def set_chain_diag_busy(self, busy: bool):
+        self._chain_diag_btn.setEnabled(not busy)
+        self._chain_diag_btn.setText("诊断中…" if busy else "链路诊断")
+
+    def set_chain_diag_status(self, text: str):
+        self._chain_diag_status.setText(text)
+
+    def set_chain_diag_report(self, text: str):
+        self._chain_diag_output.show()
+        self._chain_diag_output.setPlainText(text)
+        self._schedule_settings_size()
 
     def should_stop_services_on_exit(self) -> bool:
         return self._stop_on_exit_cb.isChecked()

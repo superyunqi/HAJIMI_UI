@@ -35,20 +35,29 @@ def detect_reference_type(query: str) -> str:
 def generate_steps(query: str, elements: Optional[List[UIElement]] = None) -> List[dict]:
     """步骤生成入口"""
     from server.services.planning import generate_steps as new_generate_steps
-    steps, _ = new_generate_steps(query, elements)
+    steps, _, _ = new_generate_steps(query, elements)
     return steps
 
 
-def process_query(query: str, image_base64: Optional[str] = None) -> ProcessResponse:
+def process_query(
+    query: str,
+    image_base64: Optional[str] = None,
+    screen_fingerprint: Optional[str] = None,
+    **kwargs,
+) -> ProcessResponse:
     """核心流程入口"""
     from server.services.planning import process_query as new_process_query
-    return new_process_query(query, image_base64)
+    return new_process_query(
+        query, image_base64, screen_fingerprint, **kwargs
+    )
 
 
 def call_deepseek(query: str, timeout: int = 30):
     """DeepSeek 调用入口"""
     from server.services.llm import call_deepseek as new_call_deepseek
-    return new_call_deepseek(query, timeout=timeout)
+
+    result, _, _, _, _ = new_call_deepseek(query)
+    return result
 
 
 def get_clarification_question(intent: Intent) -> str:

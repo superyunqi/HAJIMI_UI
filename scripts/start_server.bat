@@ -40,11 +40,13 @@ if errorlevel 1 (
 
 echo [HAJIMI] Checking A-end server dependencies...
 
-"%PYTHON%" -c "import fastapi, uvicorn" 2>nul
+"%PYTHON%" scripts\sync_llm_from_env.py >nul 2>&1
+
+"%PYTHON%" -c "import fastapi, uvicorn, sqlalchemy" 2>nul
 
 if errorlevel 1 (
 
-    echo [HAJIMI] Missing fastapi/uvicorn — run scripts\setup_server_env.bat
+    echo [HAJIMI] Missing server deps — run scripts\setup_server_env.bat
 
     exit /b 1
 
@@ -52,9 +54,19 @@ if errorlevel 1 (
 
 
 
+echo [HAJIMI] Loading server\.env into process environment ...
+
+"%PYTHON%" scripts\inject_server_env.py > "%TEMP%\hajimi_a_env.cmd" 2>nul
+
+if exist "%TEMP%\hajimi_a_env.cmd" call "%TEMP%\hajimi_a_env.cmd"
+
+
+
 echo [HAJIMI] Starting A-end on http://%HAJIMI_HOST%:%HAJIMI_PORT% (no --reload, single process) ...
 
 echo [HAJIMI] B-end: set HAJIMI_API_URL=http://%HAJIMI_HOST%:%HAJIMI_PORT%
+
+if defined OMNIPARSER_URL echo [HAJIMI] OMNIPARSER_URL=%OMNIPARSER_URL%
 
 "%PYTHON%" -m uvicorn server.main:app --host %HAJIMI_HOST% --port %HAJIMI_PORT%
 

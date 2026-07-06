@@ -61,7 +61,7 @@ class TestGenerateStepsReturnValue:
     """generate_steps 返回 steps + constraints 二元组"""
 
     def test_mock_fallback_returns_none_constraints(self):
-        steps, constraints = generate_steps("截图")
+        steps, constraints, _ = generate_steps("截图")
         assert len(steps) == 3
         assert constraints is None
 

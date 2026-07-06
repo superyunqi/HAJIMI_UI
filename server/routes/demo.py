@@ -2,10 +2,12 @@
 HAJIMI Demo API 路由
 实现 api-contract-demo.md 中定义的全部端点
 """
-from fastapi import APIRouter, Depends, HTTPException, Header, status
-from typing import Optional
+import asyncio
+from typing import Optional, Tuple
 
-from server.config import settings
+from fastapi import APIRouter, Depends, HTTPException, Header, status
+
+from server.config import CONFIG_SOURCE, reload_settings, settings
 from server.models.schemas import (
     ProcessRequest,
     ProcessResponse,
@@ -17,6 +19,8 @@ from server.models.schemas import (
     ReportResponse,
     RelocateRequest,
     RelocateResponse,
+    LocateRequest,
+    LocateResponse,
     InspectRequest,
     InspectResponse,
     HealthResponse,
@@ -28,13 +32,85 @@ from server.services.planning.blueprint_engine import BlueprintEngine
 from server.services.llm_ai import process_query, get_clarification_question
 from server.services.omniparser_client import parse_screenshot, parse_screenshot_full
 from server.services.planning.replanner import replan_steps
-from server.services.planning.router import relocate_step
+from server.services.planning.router import relocate_step, locate_step_with_vision, locate_l4_step
+from server.services.planning.route_selector import route_uses_per_step_locate
 from server.database.repository import (
     TaskRepository, RedlineRepository, FeedbackRepository, FailureRepository,
 )
 
 
 router = APIRouter(prefix="/api/demo", tags=["Demo Core"])
+
+
+def _screen_ctx_from_request(request) -> dict:
+    return {
+        "capture_size": getattr(request, "capture_size", None),
+        "upload_size": getattr(request, "upload_size", None),
+        "screen_metrics": getattr(request, "screen_metrics", None),
+        "assist_bundle": getattr(request, "assist_bundle", None),
+    }
+
+
+def _locate_step_for_route(state, step, image: str, request) -> tuple:
+    route = getattr(state, "route_mode", "") or ""
+    ctx = _screen_ctx_from_request(request)
+    if route == "L4":
+        return locate_l4_step(
+            step.action,
+            step.description,
+            image,
+            step_target=getattr(step, "target", None),
+            user_query=state.query,
+            window_title=(ctx.get("assist_bundle") or {}).get("foreground", {}).get("window_title"),
+            **ctx,
+        )
+    return locate_step_with_vision(
+        getattr(request, "query", None) or state.query,
+        step.action,
+        step.description,
+        image,
+    )[:3]
+
+
+def _probe_omniparser_sync() -> Tuple[bool, Optional[str], str]:
+    """同步探测 OmniParser（在线程池中运行，避免阻塞 event loop）。"""
+    reload_settings()
+    omniparser_ready = False
+    detector_device = None
+    omni_url = settings.OMNIPARSER_URL.rstrip("/")
+    try:
+        import httpx
+
+        with httpx.Client(timeout=3) as client:
+            health = client.get(f"{omni_url}/health")
+            if health.status_code == 200:
+                body = health.json()
+                if isinstance(body, dict):
+                    omniparser_ready = bool(
+                        body.get("ready", body.get("status") == "ok")
+                    )
+                    detector_device = body.get("device")
+            if not omniparser_ready:
+                probe = client.get(f"{omni_url}/probe/", timeout=3)
+                if probe.status_code == 200:
+                    body = probe.json()
+                    if isinstance(body, dict):
+                        omniparser_ready = bool(body.get("ready", True))
+                        detector_device = body.get("device") or detector_device
+    except Exception:
+        pass
+    return omniparser_ready, detector_device, omni_url
+
+
+def _llm_capability() -> tuple[bool, bool, str]:
+    """Returns (llm_configured, l4_capable, routing_mode)."""
+    reload_settings()
+    routing_mode = getattr(settings, "ROUTING_MODE", "auto") or "auto"
+    api_key = settings.LLM_API_KEY or settings.DEEPSEEK_API_KEY or ""
+    base_url = (settings.LLM_BASE_URL or settings.DEEPSEEK_BASE_URL or "").strip()
+    llm_configured = bool(api_key and base_url)
+    l4_capable = llm_configured
+    return llm_configured, l4_capable, routing_mode
 
 
 # ────────────────────────── 认证依赖 ──────────────────────────
@@ -60,31 +136,27 @@ def verify_demo_key(x_demo_key: Optional[str] = Header(None)) -> str:
 
 
 @router.get(
+    "/health/live",
+    summary="A 端存活探测",
+    description="不探测 OmniParser，仅确认 A 端 event loop 可用。",
+)
+async def health_live():
+    return {"status": "ok", "version": "1.0.0"}
+
+
+@router.get(
     "/health",
     response_model=HealthResponse,
     summary="服务健康检查",
     description="供前端启动时探测后端是否可用，无需认证。",
 )
 async def health_check():
-    omniparser_ready = False
-    detector_device = None
-    omni_url = settings.OMNIPARSER_URL.rstrip("/")
-    try:
-        import httpx
-        with httpx.Client(timeout=3) as client:
-            r = client.get(omni_url)
-            omniparser_ready = r.status_code < 500
-            if omniparser_ready:
-                try:
-                    probe = client.get(f"{omni_url}/probe/", timeout=3)
-                    if probe.status_code == 200:
-                        body = probe.json()
-                        if isinstance(body, dict):
-                            detector_device = body.get("device")
-                except Exception:
-                    pass
-    except Exception:
-        pass
+    omniparser_ready, detector_device, omni_url = await asyncio.to_thread(
+        _probe_omniparser_sync
+    )
+    llm_configured, l4_capable, routing_mode = await asyncio.to_thread(
+        _llm_capability
+    )
 
     return HealthResponse(
         status="ok",
@@ -94,6 +166,10 @@ async def health_check():
         detector_device=detector_device or "cpu",
         omniparser_url=omni_url,
         omniparser_ready=omniparser_ready,
+        config_source=CONFIG_SOURCE,
+        routing_mode=routing_mode,
+        llm_configured=llm_configured,
+        l4_capable=l4_capable,
     )
 
 
@@ -107,10 +183,17 @@ async def process(
     request: ProcessRequest,
     demo_key: str = Depends(verify_demo_key),
 ):
-    # 1. 调用 AI 服务生成响应（传入截图供本地 OmniParser 解析）
-    response = process_query(request.query, request.image)
-
-    # 2. 红线拦截 → 记录日志，不创建任务
+    response = await asyncio.to_thread(
+        process_query,
+        request.query,
+        request.image,
+        request.screen_fingerprint,
+        capture_size=request.capture_size,
+        upload_size=request.upload_size,
+        screen_metrics=request.screen_metrics,
+        window_title=request.window_title,
+        assist_bundle=request.assist_bundle,
+    )
     if response.redline and response.redline.triggered:
         RedlineRepository.log(
             query=request.query,
@@ -137,14 +220,45 @@ async def inspect(
     request: InspectRequest,
     demo_key: str = Depends(verify_demo_key),
 ):
-    result = parse_screenshot_full(request.image)
+    from server.services.parse_cache import get_cached_parse, put_cached_parse
+    from server.services.omniparser_client import _maybe_downscale_b64
+    from server.config import reload_settings, settings
+
+    def _run_inspect():
+        reload_settings()
+        fp = request.screen_fingerprint
+        image = request.image
+        max_side = getattr(settings, "INSPECT_MAX_SIDE", 960)
+        cleaned = image
+        if image:
+            from server.services.omniparser_client import _clean_base64
+
+            payload = _clean_base64(image)
+            if payload:
+                scaled, _, _ = _maybe_downscale_b64(payload, max_side)
+                if scaled != payload:
+                    image = f"data:image/jpeg;base64,{scaled}"
+        if fp:
+            cached = get_cached_parse(fp)
+            if cached and cached.elements:
+                return cached, True
+        result = parse_screenshot_full(image)
+        if fp and result.elements:
+            put_cached_parse(fp, result)
+        return result, False
+
+    result, cache_hit = await asyncio.to_thread(_run_inspect)
+    meta = dict(result.detection_meta or {})
+    if cache_hit:
+        meta["parse_cache_hit"] = True
+        meta["parse_latency_ms"] = 0
 
     return InspectResponse(
         success=True,
         ui_elements=result.elements,
         annotated_image=result.annotated_image,
         reference_resolution=result.reference_resolution,
-        detection_meta=result.detection_meta,
+        detection_meta=meta,
     )
 
 
@@ -194,25 +308,46 @@ async def step(
         if action == "complete":
             message = "任务已完成"
 
-        # === 动态重规划 ===
+        # === 动态重规划 / L4 逐步 Vision 定位 ===
+        route_mode = getattr(state, "route_mode", None) or ""
+        use_vision_locate = route_uses_per_step_locate(route_mode)
+
         if (
             action == "advance"
             and request.image
             and next_step
-            and not next_step.target_element_id
+            and (not next_step.target_element_id or use_vision_locate)
         ):
-            new_elements = parse_screenshot(request.image)
-            if new_elements:
-                updated_steps = replan_steps(
-                    original_query=state.query,
-                    current_step_index=state.blueprint.current_step - 1,
-                    all_steps=state.steps,
-                    new_elements=new_elements,
+            if (
+                use_vision_locate
+                and next_step.interaction != "keyboard"
+                and not next_step.locate_deferred
+            ):
+                ann, ref, meta = await asyncio.to_thread(
+                    _locate_step_for_route,
+                    state,
+                    next_step,
+                    request.image,
+                    request,
                 )
-                for i, updated in enumerate(updated_steps):
-                    if state.blueprint.current_step - 1 <= i < len(state.steps):
-                        state.steps[i] = updated
-                next_step = state.steps[state.blueprint.current_step - 1]
+                if ann:
+                    next_step.target_element_id = "~vision"
+                    next_step.annotation = ann
+                    if ref:
+                        state.ui_elements = state.ui_elements or []
+            elif not use_vision_locate and not next_step.target_element_id:
+                new_elements = await asyncio.to_thread(parse_screenshot, request.image)
+                if new_elements:
+                    updated_steps = replan_steps(
+                        original_query=state.query,
+                        current_step_index=state.blueprint.current_step - 1,
+                        all_steps=state.steps,
+                        new_elements=new_elements,
+                    )
+                    for i, updated in enumerate(updated_steps):
+                        if state.blueprint.current_step - 1 <= i < len(state.steps):
+                            state.steps[i] = updated
+                    next_step = state.steps[state.blueprint.current_step - 1]
     elif request.action == "rollback":
         action, next_step = engine.rollback(state)
         message = "已回退一步"
@@ -246,6 +381,68 @@ async def step(
         blueprint_state=state.blueprint.state,
         next_step=next_step,
         message=message,
+    )
+
+
+@router.post(
+    "/locate",
+    response_model=LocateResponse,
+    summary="Vision 逐步定位",
+    description="L4/L3_DEFERRED 路径：对指定步骤用 Vision LLM 定位，跳过 OmniParser。",
+)
+async def locate(
+    request: LocateRequest,
+    demo_key: str = Depends(verify_demo_key),
+):
+    state = task_store.get(request.task_id)
+    if not state:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "error": {
+                    "code": "NOT_FOUND",
+                    "message": f"task_id {request.task_id} 不存在",
+                    "details": {},
+                }
+            },
+        )
+
+    if request.step_index < 1 or request.step_index > len(state.steps):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "error": {
+                    "code": "INVALID_STEP_INDEX",
+                    "message": f"step_index {request.step_index} 超出范围",
+                    "details": {},
+                }
+            },
+        )
+
+    target_step = state.steps[request.step_index - 1]
+
+    ann, ref, meta = await asyncio.to_thread(
+        _locate_step_for_route,
+        state,
+        target_step,
+        request.image,
+        request,
+    )
+
+    if ann:
+        target_step.target_element_id = "~vision"
+        target_step.annotation = ann
+        target_step.status = "active"
+        task_store.update(state)
+
+    return LocateResponse(
+        success=bool(ann),
+        task_id=request.task_id,
+        step_index=request.step_index,
+        target_element_id="~vision" if ann else None,
+        annotation=ann,
+        reference_resolution=ref,
+        detection_meta=meta,
     )
 
 
@@ -288,18 +485,42 @@ async def relocate(
         )
 
     target_step = state.steps[step_index - 1]
+    route_mode = getattr(state, "route_mode", "") or ""
 
     # 3. 对新截图重定位
-    target_element_id, annotation, elements = relocate_step(
-        step_action=target_step.action,
-        step_description=target_step.description,
-        image_base64=request.image,
-    )
+    if route_mode == "L4":
+        ann, ref, _ = await asyncio.to_thread(
+            locate_l4_step,
+            target_step.action,
+            target_step.description,
+            request.image,
+            step_target=getattr(target_step, "target", None),
+            user_query=state.query,
+            capture_size=request.capture_size,
+            upload_size=request.upload_size,
+            screen_metrics=request.screen_metrics,
+            assist_bundle=request.assist_bundle,
+            window_title=(request.assist_bundle or {}).get("foreground", {}).get("window_title")
+            if request.assist_bundle
+            else None,
+        )
+        target_element_id = "~vision" if ann else None
+        elements = []
+    else:
+        target_element_id, annotation, elements, ref = await asyncio.to_thread(
+            relocate_step,
+            target_step.action,
+            target_step.description,
+            request.image,
+            query=state.query,
+            use_vision=route_uses_per_step_locate(route_mode),
+        )
+        ann = annotation
 
     # 4. 更新步骤绑定
     if target_element_id:
         target_step.target_element_id = target_element_id
-        target_step.annotation = annotation
+        target_step.annotation = ann
         target_step.status = "active"
 
     # 5. 持久化
@@ -310,8 +531,9 @@ async def relocate(
         task_id=state.task_id,
         step_index=step_index,
         target_element_id=target_element_id,
-        annotation=annotation,
+        annotation=ann,
         ui_elements=elements,
+        reference_resolution=ref,
     )
 
 

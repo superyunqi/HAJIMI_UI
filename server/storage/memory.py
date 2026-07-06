@@ -24,6 +24,7 @@ class TaskState(BaseModel):
     updated_at: str
     fingerprint: Optional[str] = None
     constraints: Optional[dict] = None
+    route_mode: Optional[str] = None
 
 
 class TaskStore:
@@ -46,6 +47,7 @@ class TaskStore:
             created_at=now,
             updated_at=now,
             constraints=response.constraints,
+            route_mode=(response.detection_meta or {}).get("route"),
         )
         with self._lock:
             self._store[state.task_id] = state
